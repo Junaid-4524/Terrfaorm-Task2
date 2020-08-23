@@ -1,0 +1,246 @@
+//CREATING THE MAIN PROVIDER
+
+provider "aws" {
+  region = "ap-south-1"
+  profile = "junaid"
+}
+
+// CREATING KEY-PAIR
+
+resource "tls_private_key" "key" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+resource "aws_key_pair" "generated_key" {
+  key_name   = "deploy-key"
+  public_key = tls_private_key.key.public_key_openssh
+}
+
+# saving key to local file
+resource "local_file" "deploy-key" {
+    content  = tls_private_key.key.private_key_pem
+    filename = "C:/Users/Junaid/Desktop/terra/task1/deploy-key.pem"
+
+    file_permission = "0400"
+}
+
+//CREATING SECURITY GROUP
+
+resource "aws_security_group" "terraform_sg" {
+  name        = "terra-ec2"
+  description = "Allow http and ssh inbound traffic"
+
+  ingress {
+    description = "TLS from VPC"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+ingress {
+    description = "TLS from VPC"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "allow_from_terraform"
+  }
+}
+
+
+
+resource "aws_security_group" "terra-efs-sg" {
+  name        = "terr-efs-sg"
+  description = "Allow ec2"
+
+  ingress {
+    description = "for ec2"
+    from_port   = 2049
+    to_port     = 2049
+    protocol    = "tcp"
+    security_groups = ["${aws_security_group.terraform_sg.id}"]
+ }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "allow_for_efs"
+  }
+}
+
+
+
+resource "aws_efs_file_system" "efs" {
+  creation_token = "efs-for-ec2"
+
+  tags = {
+    Name = "terra ec2 "
+  }
+}
+resource "aws_efs_mount_target" "efs-mount-c" {
+   file_system_id  = "${aws_efs_file_system.efs.id}"
+   subnet_id = "subnet-09335845"
+   security_groups = ["${aws_security_group.terra-efs-sg.id}"]
+}
+resource "aws_efs_mount_target" "efs-mount-b" {
+   file_system_id  = "${aws_efs_file_system.efs.id}"
+   subnet_id = "subnet-7c053f14"
+   security_groups = ["${aws_security_group.terra-efs-sg.id}"]
+}
+resource "aws_efs_mount_target" "efs-mount-a" {
+   file_system_id  = "${aws_efs_file_system.efs.id}"
+   subnet_id = "subnet-9a03b1e1"
+   security_groups = ["${aws_security_group.terra-efs-sg.id}"]
+}
+
+
+// CREATING THE  INSTANCE
+
+resource "aws_instance" "terraform_ec2" {
+  ami             = "ami-0732b62d310b80e97"
+  instance_type   = "t2.micro"
+  key_name        = aws_key_pair.generated_key.key_name
+  security_groups = ["terra-ec2"]
+
+  depends_on = [ local_file.deploy-key, aws_security_group.terraform_sg, aws_efs_mount_target.efs-mount-b ,aws_efs_mount_target.efs-mount-c ,aws_efs_mount_target.efs-mount-a ]
+  tags = {
+    Name = "terraform"
+  }
+}
+
+resource "null_resource" "ssh_ec2" {
+depends_on = [
+  aws_efs_file_system.efs,
+  local_file.deploy-key,
+]
+  connection {
+    type = "ssh"
+    user = "ec2-user"
+    private_key = file("C:/Users/Junaid/Desktop/terra/task1/deploy-key.pem")
+    host = aws_instance.terraform_ec2.public_ip
+}
+
+provisioner "remote-exec" {
+  inline = [
+    "sudo yum install httpd amazon-efs-utils git -y",                                           
+    "sudo mount -t efs ${aws_efs_file_system.efs.id}:/ /var/www/html",
+    "sudo systemctl start httpd",  
+    "sudo rm -rf /var/www/html/*",
+    "sudo git clone https://github.com/Junaid-4524/Task-1 /var/www/html",
+    ]
+
+  }
+}
+
+// CREATING THE S3 BUCKET
+
+resource "aws_s3_bucket" "terra_s3" {
+  bucket = "junaidtfs3"
+  acl    = "public-read"
+  tags = {
+    Name        = "My bucket"
+  }
+}
+
+
+resource "null_resource" "upload_to_s3" {
+    depends_on = [ aws_s3_bucket.terra_s3, ]
+    provisioner "local-exec" {
+      command = "git clone https://github.com/Junaid-4524/Task-1 C:/Users/Junaid/Desktop/terra/s3"
+      }
+    provisioner "local-exec" {
+
+      command = "aws s3 sync C:/Users/Junaid/Desktop/terra/s3 s3://junaidtfs3/"
+      }
+    provisioner "local-exec" {
+
+      command = "aws s3api put-object-acl --bucket junaidtfs3 --key toxic.jpg --acl public-read"
+    }
+}
+
+
+//  Create Cloudfront distribution
+
+resource "aws_cloudfront_distribution" "distribution" {
+    origin {
+        domain_name = "${aws_s3_bucket.terra_s3.bucket_regional_domain_name}"
+        origin_id = "S3-${aws_s3_bucket.terra_s3.bucket}"
+
+        custom_origin_config {
+            http_port = 80
+            https_port = 443
+            origin_protocol_policy = "match-viewer"
+            origin_ssl_protocols = ["TLSv1", "TLSv1.1", "TLSv1.2"]
+        }
+    }
+    # By default, show index.html file
+    default_root_object = "index.html"
+    enabled = true
+
+
+    # If there is a 404, return index.html with a HTTP 200 Response
+    custom_error_response {
+        error_caching_min_ttl = 3000
+        error_code = 404
+        response_code = 200
+        response_page_path = "/index.html"
+    }
+
+
+    default_cache_behavior {
+        allowed_methods = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+        cached_methods = ["GET", "HEAD"]
+        target_origin_id = "S3-${aws_s3_bucket.terra_s3.bucket}"
+
+
+        #Not Forward all query strings, cookies and headers
+        forwarded_values {
+            query_string = false
+	    cookies {
+		forward = "none"
+	    }
+
+        }
+
+
+        viewer_protocol_policy = "redirect-to-https"
+        min_ttl = 0
+        default_ttl = 3600
+        max_ttl = 86400
+    }
+
+
+    # Distributes content to all
+    price_class = "PriceClass_All"
+
+
+    # Restricts who is able to access this content
+    restrictions {
+        geo_restriction {
+            # type of restriction, blacklist, whitelist or none
+            restriction_type = "none"
+        }
+    }
+
+
+    # SSL certificate for the service.
+    viewer_certificate {
+        cloudfront_default_certificate = true
+    }    
+}
